@@ -1,18 +1,22 @@
 "use client"
 
-import { useState } from "react"
-import { useApp } from "@/lib/store"
+import { useState, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Play, Plus, X, FileCode, Terminal } from "lucide-react"
 import { Textarea } from "@/components/ui/textarea"
+import { createClient } from "@/lib/supabase/client"
 
 interface CodeFile {
   id: string
+  project_id: string
   name: string
   language: string
   content: string
+  created_by: string
+  created_at: string
+  updated_at: string
 }
 
 const languages = [
@@ -24,73 +28,142 @@ const languages = [
   { value: "json", label: "JSON" },
 ]
 
-const defaultFiles: CodeFile[] = [
-  {
-    id: "1",
-    name: "index.js",
-    language: "javascript",
-    content: `// Welcome to Developia Code Editor
-function greet(name) {
-  return \`Hello, \${name}!\`;
+interface CodeEditorProps {
+  currentProject: any
+  currentUser: any
 }
 
-console.log(greet("World"));`,
-  },
-  {
-    id: "2",
-    name: "styles.css",
-    language: "css",
-    content: `/* Add your styles here */
-body {
-  font-family: system-ui, sans-serif;
-  margin: 0;
-  padding: 20px;
-  background: #f5f5f5;
-}
-
-.container {
-  max-width: 1200px;
-  margin: 0 auto;
-}`,
-  },
-]
-
-export function CodeEditor() {
-  const { currentProject } = useApp()
-  const [files, setFiles] = useState<CodeFile[]>(defaultFiles)
-  const [activeFileId, setActiveFileId] = useState(files[0].id)
+export function CodeEditor({ currentProject, currentUser }: CodeEditorProps) {
+  const supabase = createClient()
+  const [files, setFiles] = useState<CodeFile[]>([])
+  const [activeFileId, setActiveFileId] = useState<string | null>(null)
   const [output, setOutput] = useState("")
 
   const activeFile = files.find((f) => f.id === activeFileId)
 
-  const handleCodeChange = (content: string) => {
-    setFiles(files.map((f) => (f.id === activeFileId ? { ...f, content } : f)))
-  }
+  useEffect(() => {
+    if (!currentProject) return
 
-  const handleLanguageChange = (language: string) => {
-    setFiles(files.map((f) => (f.id === activeFileId ? { ...f, language } : f)))
-  }
+    const fetchFiles = async () => {
+      const { data, error } = await supabase
+        .from("code_files")
+        .select("*")
+        .eq("project_id", currentProject.id)
+        .order("created_at")
 
-  const handleAddFile = () => {
-    const newFile: CodeFile = {
-      id: Date.now().toString(),
-      name: `untitled-${files.length + 1}.js`,
-      language: "javascript",
-      content: "// Start coding...\n",
+      if (error) {
+        console.error("[v0] Error fetching code files:", error)
+        return
+      }
+
+      setFiles(data || [])
+      if (data && data.length > 0 && !activeFileId) {
+        setActiveFileId(data[0].id)
+      }
     }
-    setFiles([...files, newFile])
-    setActiveFileId(newFile.id)
+
+    fetchFiles()
+
+    // Subscribe to code file changes
+    const subscription = supabase
+      .channel(`code_files:${currentProject.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "code_files",
+          filter: `project_id=eq.${currentProject.id}`,
+        },
+        () => {
+          fetchFiles()
+        },
+      )
+      .subscribe()
+
+    return () => {
+      subscription.unsubscribe()
+    }
+  }, [currentProject])
+
+  const handleCodeChange = async (content: string) => {
+    if (!activeFileId) return
+
+    setFiles(files.map((f) => (f.id === activeFileId ? { ...f, content } : f)))
+
+    const { error } = await supabase
+      .from("code_files")
+      .update({ content, updated_at: new Date().toISOString() })
+      .eq("id", activeFileId)
+
+    if (error) {
+      console.error("[v0] Error updating code file:", error)
+    }
   }
 
-  const handleCloseFile = (id: string) => {
-    const newFiles = files.filter((f) => f.id !== id)
-    if (newFiles.length === 0) {
-      handleAddFile()
+  const handleLanguageChange = async (language: string) => {
+    if (!activeFileId) return
+
+    setFiles(files.map((f) => (f.id === activeFileId ? { ...f, language } : f)))
+
+    const { error } = await supabase
+      .from("code_files")
+      .update({ language, updated_at: new Date().toISOString() })
+      .eq("id", activeFileId)
+
+    if (error) {
+      console.error("[v0] Error updating language:", error)
+    }
+  }
+
+  const handleAddFile = async () => {
+    if (!currentProject || !currentUser) return
+
+    const { data, error } = await supabase
+      .from("code_files")
+      .insert({
+        project_id: currentProject.id,
+        name: `untitled-${files.length + 1}.js`,
+        language: "javascript",
+        content: "// Start coding...\n",
+        created_by: currentUser.id,
+      })
+      .select()
+      .single()
+
+    if (error) {
+      console.error("[v0] Error creating code file:", error)
       return
     }
-    setFiles(newFiles)
-    if (activeFileId === id) {
-      setActiveFileId(newFiles[0].id)
+
+    // Log activity
+    await supabase.from("activity_logs").insert({
+      project_id: currentProject.id,
+      user_id: currentUser.id,
+      user_name: currentUser.name || currentUser.email,
+      action: "created file",
+      resource_type: "code_file",
+      resource_name: data.name,
+    })
+
+    setActiveFileId(data.id)
+  }
+
+  const handleCloseFile = async (id: string) => {
+    if (!currentProject) return
+
+    const { error } = await supabase.from("code_files").delete().eq("id", id)
+
+    if (error) {
+      console.error("[v0] Error deleting code file:", error)
+      return
+    }
+
+    if (activeFileId === id && files.length > 1) {
+      const remainingFiles = files.filter((f) => f.id !== id)
+      setActiveFileId(remainingFiles[0]?.id || null)
+    } else if (files.length === 1) {
+      handleAddFile()
     }
   }
 
@@ -98,7 +171,6 @@ export function CodeEditor() {
     if (!activeFile) return
 
     try {
-      // Simple code execution simulation
       if (activeFile.language === "javascript" || activeFile.language === "typescript") {
         const logs: string[] = []
         const originalLog = console.log
@@ -106,7 +178,6 @@ export function CodeEditor() {
           logs.push(args.join(" "))
         }
 
-        // eslint-disable-next-line no-eval
         eval(activeFile.content)
 
         console.log = originalLog
@@ -194,11 +265,11 @@ export function CodeEditor() {
       {/* Editor and Output */}
       <div className="flex flex-1 overflow-hidden">
         {/* Code Editor */}
-        <div className="flex flex-1 flex-col border-r">
+        <div className="flex flex-1 flex-col border-r overflow-hidden">
           <Textarea
             value={activeFile?.content || ""}
             onChange={(e) => handleCodeChange(e.target.value)}
-            className="h-full resize-none rounded-none border-0 font-mono text-sm leading-relaxed focus-visible:ring-0"
+            className="h-full resize-none rounded-none border-0 font-mono text-sm leading-relaxed focus-visible:ring-0 overflow-auto"
             placeholder="Start coding..."
           />
         </div>

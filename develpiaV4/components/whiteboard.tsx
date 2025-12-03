@@ -1,14 +1,13 @@
 "use client"
 
 import type React from "react"
-
 import { useState, useRef, useEffect } from "react"
-import { useApp } from "@/lib/store"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Slider } from "@/components/ui/slider"
-import { Pencil, Eraser, Trash2, Download, Undo, Redo } from "lucide-react"
+import { Pencil, Eraser, Trash2, Download, Undo, Redo, ZoomIn, ZoomOut } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { createClient } from "@/lib/supabase/client"
 
 interface Point {
   x: number
@@ -30,9 +29,15 @@ const colors = [
   { name: "Purple", value: "#a855f7" },
 ]
 
-export function Whiteboard() {
-  const { currentProject } = useApp()
+interface WhiteboardProps {
+  currentProject: any
+  currentUser: any
+}
+
+export function Whiteboard({ currentProject, currentUser }: WhiteboardProps) {
+  const supabase = createClient()
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
   const [isDrawing, setIsDrawing] = useState(false)
   const [currentPath, setCurrentPath] = useState<Point[]>([])
   const [paths, setPaths] = useState<Path[]>([])
@@ -41,6 +46,72 @@ export function Whiteboard() {
   const [tool, setTool] = useState<"pen" | "eraser">("pen")
   const [color, setColor] = useState("#000000")
   const [brushSize, setBrushSize] = useState(3)
+  const [zoom, setZoom] = useState(1)
+  const [panX, setPanX] = useState(0)
+  const [panY, setPanY] = useState(0)
+  const [cursorPreview, setCursorPreview] = useState<{ x: number; y: number; visible: boolean }>({
+    x: 0,
+    y: 0,
+    visible: false,
+  })
+  const [isConnected, setIsConnected] = useState(false)
+
+  useEffect(() => {
+    if (!currentProject) return
+
+    const loadWhiteboard = async () => {
+      const { data, error } = await supabase
+        .from("whiteboard_data")
+        .select("*")
+        .eq("project_id", currentProject.id)
+        .order("updated_at", { ascending: false })
+        .limit(1)
+        .single()
+
+      if (error && error.code !== "PGRST116") {
+        console.error("[v0] Error loading whiteboard:", error)
+        return
+      }
+
+      if (data && data.paths) {
+        setPaths(data.paths as Path[])
+        setHistory([data.paths as Path[]])
+        setHistoryStep(0)
+      }
+    }
+
+    loadWhiteboard()
+  }, [currentProject])
+
+  useEffect(() => {
+    if (!currentProject || !currentUser || paths.length === 0) return
+
+    const timer = setTimeout(async () => {
+      const { data: existing } = await supabase
+        .from("whiteboard_data")
+        .select("id")
+        .eq("project_id", currentProject.id)
+        .single()
+
+      if (existing) {
+        await supabase
+          .from("whiteboard_data")
+          .update({
+            paths: paths,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", existing.id)
+      } else {
+        await supabase.from("whiteboard_data").insert({
+          project_id: currentProject.id,
+          user_id: currentUser.id,
+          paths: paths,
+        })
+      }
+    }, 1000)
+
+    return () => clearTimeout(timer)
+  }, [paths, currentProject, currentUser])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -49,15 +120,17 @@ export function Whiteboard() {
     const ctx = canvas.getContext("2d")
     if (!ctx) return
 
-    // Set canvas size
     canvas.width = canvas.offsetWidth
     canvas.height = canvas.offsetHeight
 
-    // Clear canvas
     ctx.fillStyle = "#ffffff"
     ctx.fillRect(0, 0, canvas.width, canvas.height)
 
-    // Redraw all paths
+    ctx.save()
+    ctx.translate(panX + canvas.width / 2, panY + canvas.height / 2)
+    ctx.scale(zoom, zoom)
+    ctx.translate(-canvas.width / 2, -canvas.height / 2)
+
     paths.forEach((path) => {
       if (path.points.length < 2) return
 
@@ -75,16 +148,54 @@ export function Whiteboard() {
 
       ctx.stroke()
     })
-  }, [paths])
+
+    ctx.restore()
+  }, [paths, zoom, panX, panY])
+
+  useEffect(() => {
+    if (!currentProject) return
+
+    const channel = supabase
+      .channel(`whiteboard:${currentProject.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "whiteboard_data",
+          filter: `project_id=eq.${currentProject.id}`,
+        },
+        (payload) => {
+          console.log("[v0] Whiteboard updated remotely")
+          if (payload.new.paths) {
+            setPaths(payload.new.paths as Path[])
+          }
+        },
+      )
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          setIsConnected(true)
+          console.log("[v0] Whiteboard real-time connected")
+        }
+      })
+
+    return () => {
+      channel.unsubscribe()
+      setIsConnected(false)
+    }
+  }, [currentProject, supabase])
 
   const getCoordinates = (e: React.MouseEvent<HTMLCanvasElement>): Point => {
     const canvas = canvasRef.current
     if (!canvas) return { x: 0, y: 0 }
 
     const rect = canvas.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+
     return {
-      x: e.clientX - rect.left,
-      y: e.clientY - rect.top,
+      x: (x - panX - canvas.width / 2) / zoom + canvas.width / 2,
+      y: (y - panY - canvas.height / 2) / zoom + canvas.height / 2,
     }
   }
 
@@ -111,10 +222,17 @@ export function Whiteboard() {
     ctx.lineJoin = "round"
 
     if (currentPath.length > 0) {
+      ctx.save()
+      ctx.translate(panX + canvas.width / 2, panY + canvas.height / 2)
+      ctx.scale(zoom, zoom)
+      ctx.translate(-canvas.width / 2, -canvas.height / 2)
+
       ctx.beginPath()
       ctx.moveTo(currentPath[currentPath.length - 1].x, currentPath[currentPath.length - 1].y)
       ctx.lineTo(point.x, point.y)
       ctx.stroke()
+
+      ctx.restore()
     }
   }
 
@@ -129,7 +247,6 @@ export function Whiteboard() {
       const newPaths = [...paths, newPath]
       setPaths(newPaths)
 
-      // Update history
       const newHistory = history.slice(0, historyStep + 1)
       newHistory.push(newPaths)
       setHistory(newHistory)
@@ -138,6 +255,26 @@ export function Whiteboard() {
 
     setIsDrawing(false)
     setCurrentPath([])
+  }
+
+  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    const delta = e.deltaY > 0 ? 0.9 : 1.1
+    setZoom((prev) => Math.max(0.5, Math.min(5, prev * delta)))
+  }
+
+  const handleZoomIn = () => {
+    setZoom((prev) => Math.min(5, prev * 1.2))
+  }
+
+  const handleZoomOut = () => {
+    setZoom((prev) => Math.max(0.5, prev / 1.2))
+  }
+
+  const handleResetZoom = () => {
+    setZoom(1)
+    setPanX(0)
+    setPanY(0)
   }
 
   const clearCanvas = () => {
@@ -171,6 +308,27 @@ export function Whiteboard() {
     link.click()
   }
 
+  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+
+    const rect = canvas.getBoundingClientRect()
+    setCursorPreview({
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top,
+      visible: true,
+    })
+
+    if (isDrawing) {
+      draw(e)
+    }
+  }
+
+  const handleMouseLeave = () => {
+    setCursorPreview({ ...cursorPreview, visible: false })
+    stopDrawing()
+  }
+
   if (!currentProject) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -185,7 +343,7 @@ export function Whiteboard() {
   return (
     <div className="flex h-full flex-col">
       {/* Toolbar */}
-      <div className="flex items-center gap-4 border-b bg-card p-4">
+      <div className="flex items-center gap-4 border-b bg-card p-4 overflow-x-auto">
         <div className="flex items-center gap-2">
           <Button
             size="sm"
@@ -242,6 +400,21 @@ export function Whiteboard() {
           <span className="w-8 text-sm">{brushSize}</span>
         </div>
 
+        <div className="h-6 w-px bg-border" />
+
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant="outline" onClick={handleZoomOut}>
+            <ZoomOut className="h-4 w-4" />
+          </Button>
+          <span className="w-12 text-center text-sm">{Math.round(zoom * 100)}%</span>
+          <Button size="sm" variant="outline" onClick={handleZoomIn}>
+            <ZoomIn className="h-4 w-4" />
+          </Button>
+          <Button size="sm" variant="outline" onClick={handleResetZoom}>
+            Reset
+          </Button>
+        </div>
+
         <div className="ml-auto flex items-center gap-2">
           <Button size="sm" variant="outline" onClick={undo} disabled={historyStep === 0}>
             <Undo className="h-4 w-4" />
@@ -256,19 +429,39 @@ export function Whiteboard() {
             <Download className="h-4 w-4" />
           </Button>
         </div>
+
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <div className={cn("h-2 w-2 rounded-full", isConnected ? "bg-green-500" : "bg-gray-400")} />
+          {isConnected ? "Live" : "Offline"}
+        </div>
       </div>
 
-      {/* Canvas */}
-      <div className="flex-1 overflow-hidden bg-muted/20 p-4">
+      {/* Canvas Container */}
+      <div ref={containerRef} className="relative flex-1 overflow-hidden bg-muted/20 p-4" onWheel={handleWheel}>
         <Card className="h-full w-full overflow-hidden">
           <canvas
             ref={canvasRef}
             className="h-full w-full cursor-crosshair"
             onMouseDown={startDrawing}
-            onMouseMove={draw}
+            onMouseMove={handleMouseMove}
             onMouseUp={stopDrawing}
-            onMouseLeave={stopDrawing}
+            onMouseLeave={handleMouseLeave}
           />
+
+          {cursorPreview.visible && !isDrawing && (
+            <div
+              className="pointer-events-none absolute rounded-full border-2 border-primary"
+              style={{
+                left: cursorPreview.x,
+                top: cursorPreview.y,
+                width: brushSize * zoom * 2,
+                height: brushSize * zoom * 2,
+                transform: "translate(-50%, -50%)",
+                borderColor: tool === "eraser" ? "#ef4444" : color,
+                opacity: 0.5,
+              }}
+            />
+          )}
         </Card>
       </div>
     </div>

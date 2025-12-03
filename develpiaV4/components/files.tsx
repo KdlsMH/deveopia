@@ -1,9 +1,7 @@
 "use client"
 
 import type React from "react"
-
-import { useState } from "react"
-import { useApp } from "@/lib/store"
+import { useState, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -25,7 +23,19 @@ import {
   List,
 } from "lucide-react"
 import { format } from "date-fns"
-import type { FileItem } from "@/lib/types"
+import { createClient } from "@/lib/supabase/client"
+
+interface FileItem {
+  id: string
+  project_id: string
+  user_id: string
+  name: string
+  url: string
+  file_type: string
+  size: number
+  uploaded_by: string
+  uploaded_at: string
+}
 
 const getFileIcon = (type: string) => {
   if (type.startsWith("image/")) return FileImage
@@ -43,33 +53,154 @@ const formatFileSize = (bytes: number) => {
   return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + " " + sizes[i]
 }
 
-export function Files() {
-  const { currentProject, files, addFile } = useApp()
+interface FilesProps {
+  currentProject: any
+  currentUser: any
+}
+
+export function Files({ currentProject, currentUser }: FilesProps) {
+  const supabase = createClient()
+  const [files, setFiles] = useState<FileItem[]>([])
   const [searchQuery, setSearchQuery] = useState("")
   const [viewMode, setViewMode] = useState<"grid" | "list">("grid")
 
-  const projectFiles = files.filter((f) => f.projectId === currentProject?.id)
-  const filteredFiles = projectFiles.filter((file) => file.name.toLowerCase().includes(searchQuery.toLowerCase()))
+  const filteredFiles = files.filter((file) => file.name.toLowerCase().includes(searchQuery.toLowerCase()))
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const uploadedFiles = e.target.files
-    if (!uploadedFiles || !currentProject) return
+  useEffect(() => {
+    if (!currentProject) return
 
-    Array.from(uploadedFiles).forEach((file) => {
-      const newFile: FileItem = {
-        id: Date.now().toString() + Math.random(),
-        projectId: currentProject.id,
-        name: file.name,
-        type: file.type,
-        size: file.size,
-        url: URL.createObjectURL(file),
-        uploadedBy: "User",
-        uploadedAt: new Date(),
+    const fetchFiles = async () => {
+      const { data, error } = await supabase
+        .from("files")
+        .select("*")
+        .eq("project_id", currentProject.id)
+        .order("uploaded_at", { ascending: false })
+
+      if (error) {
+        console.error("[v0] Error fetching files:", error)
+        return
       }
-      addFile(newFile)
+
+      setFiles(data || [])
+    }
+
+    fetchFiles()
+
+    // Subscribe to file changes
+    const subscription = supabase
+      .channel(`files:${currentProject.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "files",
+          filter: `project_id=eq.${currentProject.id}`,
+        },
+        () => {
+          fetchFiles()
+        },
+      )
+      .subscribe()
+
+    return () => {
+      subscription.unsubscribe()
+    }
+  }, [currentProject])
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const uploadedFiles = e.target.files
+    if (!uploadedFiles || !currentProject || !currentUser) return
+
+    Array.from(uploadedFiles).forEach(async (file) => {
+      try {
+        // Upload to Supabase Storage
+        const filePath = `${currentProject.id}/${Date.now()}-${file.name}`
+        const { data: uploadData, error: uploadError } = await supabase.storage
+          .from("project-files")
+          .upload(filePath, file)
+
+        if (uploadError) {
+          console.error("[v0] Error uploading to storage:", uploadError)
+          return
+        }
+
+        // Get public URL
+        const {
+          data: { publicUrl },
+        } = supabase.storage.from("project-files").getPublicUrl(filePath)
+
+        // Save metadata to database
+        const { error } = await supabase.from("files").insert({
+          project_id: currentProject.id,
+          user_id: currentUser.id,
+          name: file.name,
+          file_type: file.type,
+          size: file.size,
+          url: publicUrl,
+          uploaded_by: currentUser.name || currentUser.email,
+        })
+
+        if (error) {
+          console.error("[v0] Error saving file metadata:", error)
+          return
+        }
+
+        // Log activity
+        await supabase.from("activity_logs").insert({
+          project_id: currentProject.id,
+          user_id: currentUser.id,
+          user_name: currentUser.name || currentUser.email,
+          action: "uploaded file",
+          resource_type: "file",
+          resource_name: file.name,
+        })
+
+        console.log("[v0] File uploaded successfully:", file.name)
+      } catch (error) {
+        console.error("[v0] Upload error:", error)
+      }
     })
 
     e.target.value = ""
+  }
+
+  const deleteFile = async (id: string) => {
+    const file = files.find((f) => f.id === id)
+    if (!file) return
+
+    try {
+      // Extract file path from URL
+      const urlParts = file.url.split("/project-files/")
+      if (urlParts.length > 1) {
+        const filePath = urlParts[1].split("?")[0]
+
+        // Delete from storage
+        const { error: storageError } = await supabase.storage.from("project-files").remove([filePath])
+
+        if (storageError) {
+          console.error("[v0] Error deleting from storage:", storageError)
+        }
+      }
+
+      // Delete from database
+      const { error } = await supabase.from("files").delete().eq("id", id)
+
+      if (error) {
+        console.error("[v0] Error deleting file:", error)
+      } else {
+        console.log("[v0] File deleted successfully")
+      }
+    } catch (error) {
+      console.error("[v0] Delete error:", error)
+    }
+  }
+
+  const downloadFile = (file: FileItem) => {
+    const link = document.createElement("a")
+    link.href = file.url
+    link.download = file.name
+    link.click()
   }
 
   if (!currentProject) {
@@ -149,7 +280,7 @@ export function Files() {
         ) : viewMode === "grid" ? (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {filteredFiles.map((file) => {
-              const Icon = getFileIcon(file.type)
+              const Icon = getFileIcon(file.file_type)
               return (
                 <Card key={file.id} className="group overflow-hidden transition-shadow hover:shadow-md">
                   <CardContent className="p-4">
@@ -164,11 +295,11 @@ export function Files() {
                           </Button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end">
-                          <DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => downloadFile(file)}>
                             <Download className="mr-2 h-4 w-4" />
                             Download
                           </DropdownMenuItem>
-                          <DropdownMenuItem className="text-destructive">
+                          <DropdownMenuItem className="text-destructive" onClick={() => deleteFile(file.id)}>
                             <Trash2 className="mr-2 h-4 w-4" />
                             Delete
                           </DropdownMenuItem>
@@ -179,11 +310,11 @@ export function Files() {
                     <div className="flex items-center gap-2 text-xs text-muted-foreground">
                       <span>{formatFileSize(file.size)}</span>
                       <span>•</span>
-                      <span>{format(file.uploadedAt, "MMM d")}</span>
+                      <span>{format(new Date(file.uploaded_at), "MMM d")}</span>
                     </div>
                     <div className="mt-2">
                       <Badge variant="secondary" className="text-xs">
-                        {file.uploadedBy}
+                        {file.uploaded_by}
                       </Badge>
                     </div>
                   </CardContent>
@@ -194,7 +325,7 @@ export function Files() {
         ) : (
           <div className="space-y-2">
             {filteredFiles.map((file) => {
-              const Icon = getFileIcon(file.type)
+              const Icon = getFileIcon(file.file_type)
               return (
                 <Card key={file.id} className="group transition-shadow hover:shadow-sm">
                   <CardContent className="flex items-center gap-4 p-4">
@@ -206,9 +337,9 @@ export function Files() {
                       <div className="flex items-center gap-2 text-sm text-muted-foreground">
                         <span>{formatFileSize(file.size)}</span>
                         <span>•</span>
-                        <span>Uploaded by {file.uploadedBy}</span>
+                        <span>Uploaded by {file.uploaded_by}</span>
                         <span>•</span>
-                        <span>{format(file.uploadedAt, "MMM d, yyyy")}</span>
+                        <span>{format(new Date(file.uploaded_at), "MMM d, yyyy")}</span>
                       </div>
                     </div>
                     <DropdownMenu>
@@ -218,11 +349,11 @@ export function Files() {
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
-                        <DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => downloadFile(file)}>
                           <Download className="mr-2 h-4 w-4" />
                           Download
                         </DropdownMenuItem>
-                        <DropdownMenuItem className="text-destructive">
+                        <DropdownMenuItem className="text-destructive" onClick={() => deleteFile(file.id)}>
                           <Trash2 className="mr-2 h-4 w-4" />
                           Delete
                         </DropdownMenuItem>
