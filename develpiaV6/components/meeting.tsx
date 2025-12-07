@@ -56,6 +56,11 @@ interface Participant {
   stream?: MediaStream
 }
 
+interface PeerConnection {
+  connection: RTCPeerConnection
+  stream?: MediaStream
+}
+
 const colors = ["#000000", "#ef4444", "#3b82f6", "#22c55e", "#eab308", "#a855f7"]
 
 export function Meeting({ currentProjectId }: { currentProjectId: string | null }) {
@@ -67,23 +72,26 @@ export function Meeting({ currentProjectId }: { currentProjectId: string | null 
   const [participants, setParticipants] = useState<Participant[]>([])
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null)
+  const [peerConnections, setPeerConnections] = useState<Map<string, PeerConnection>>(new Map())
   const supabase = createClient()
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const localVideoRef = useRef<HTMLVideoElement>(null)
   const screenVideoRef = useRef<HTMLVideoElement>(null)
-  const [isDrawing, setIsDrawing] = useState(false)
-  const [currentPath, setCurrentPath] = useState<Point[]>([])
-  const [paths, setPaths] = useState<Path[]>([])
-  const [tool, setTool] = useState<"pen" | "eraser">("pen")
-  const [color, setColor] = useState("#ef4444")
-  const [brushSize, setBrushSize] = useState(3)
-  const [hasJoined, setHasJoined] = useState(false)
-  const [isScreenShareAvailable, setIsScreenShareAvailable] = useState(false)
+  const remoteVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map())
+
   const { currentUser, currentProject } = useProject()
   const [activeTab, setActiveTab] = useState("chat")
+  const [hasJoined, setHasJoined] = useState(false)
+  const [isScreenShareAvailable, setIsScreenShareAvailable] = useState(false)
+  const [paths, setPaths] = useState<Path[]>([])
+  const [isDrawing, setIsDrawing] = useState(false)
+  const [currentPath, setCurrentPath] = useState<Point[]>([])
+  const [tool, setTool] = useState("pen")
+  const [color, setColor] = useState("#000000")
+  const [brushSize, setBrushSize] = useState(5)
 
   useEffect(() => {
-    if (!currentProject || !currentUser) return
+    if (!currentProject || !currentUser || !hasJoined) return
 
     console.log("[v0] Meeting initializing for project:", currentProject.name)
 
@@ -117,25 +125,10 @@ export function Meeting({ currentProjectId }: { currentProjectId: string | null 
       }
     }
 
-    const loadMessages = async () => {
-      const { data } = await supabase
-        .from("messages")
-        .select("*")
-        .eq("project_id", currentProject.id)
-        .eq("type", "meeting")
-        .order("created_at", { ascending: true })
-
-      if (data) {
-        console.log("[v0] Meeting messages loaded:", data.length)
-        setChatMessages(data)
-      }
-    }
-
     loadParticipants()
-    loadMessages()
 
     const presenceChannel = supabase
-      .channel(`meeting:${currentProject.id}`)
+      .channel(`presence:${currentProject.id}:meeting`)
       .on(
         "postgres_changes",
         {
@@ -145,21 +138,8 @@ export function Meeting({ currentProjectId }: { currentProjectId: string | null 
           filter: `project_id=eq.${currentProject.id}`,
         },
         () => {
+          console.log("[v0] Presence changed, reloading participants")
           loadParticipants()
-        },
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "messages",
-          filter: `project_id=eq.${currentProject.id}`,
-        },
-        (payload) => {
-          if (payload.new.type === "meeting") {
-            setChatMessages((prev) => [...prev, payload.new as ChatMessage])
-          }
         },
       )
       .subscribe()
@@ -167,20 +147,46 @@ export function Meeting({ currentProjectId }: { currentProjectId: string | null 
     return () => {
       presenceChannel.unsubscribe()
     }
-  }, [currentProject, currentUser, supabase])
+  }, [currentProject, currentUser, hasJoined])
+
+  useEffect(() => {
+    if (!currentProject || !currentUser || !hasJoined) return
+
+    const signalingChannel = supabase.channel(`meeting:${currentProject.id}`)
+
+    signalingChannel
+      .on("broadcast", { event: "offer" }, async ({ payload }) => {
+        if (payload.to === currentUser.id) {
+          await handleOffer(payload.from, payload.offer)
+        }
+      })
+      .on("broadcast", { event: "answer" }, async ({ payload }) => {
+        if (payload.to === currentUser.id) {
+          await handleAnswer(payload.from, payload.answer)
+        }
+      })
+      .on("broadcast", { event: "ice-candidate" }, async ({ payload }) => {
+        if (payload.to === currentUser.id) {
+          await handleIceCandidate(payload.from, payload.candidate)
+        }
+      })
+      .subscribe()
+
+    return () => {
+      signalingChannel.unsubscribe()
+    }
+  }, [currentProject, currentUser, hasJoined])
 
   const handleJoinMeeting = async () => {
     if (!currentProject || !currentUser) return
 
     setHasJoined(true)
-
-    // 기본적으로 마이크만 켜고 카메라는 끈 상태로 시작
     setIsMicOn(true)
     setIsVideoOn(false)
+
     await initializeWebRTC(false, true)
 
-    // Update presence
-    await supabase.from("user_presence").upsert(
+    const { error } = await supabase.from("user_presence").upsert(
       {
         user_id: currentUser.id,
         project_id: currentProject.id,
@@ -192,61 +198,19 @@ export function Meeting({ currentProjectId }: { currentProjectId: string | null 
       { onConflict: "user_id" },
     )
 
-    // Log activity
-    await supabase.from("activity_logs").insert({
-      project_id: currentProject.id,
-      user_id: currentUser.id,
-      user_name: currentUser.name || currentUser.email,
-      action: "joined",
-      resource_type: "meeting",
-      resource_name: currentProject.name,
-    })
-
-    // Start presence interval
-    const presenceInterval = setInterval(async () => {
-      if (hasJoined) {
-        await supabase.from("user_presence").upsert(
-          {
-            user_id: currentUser.id,
-            project_id: currentProject.id,
-            status: "online",
-            current_view: "meeting",
-            last_seen: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: "user_id" },
-        )
-      }
-    }, 30000)
-
-    return () => clearInterval(presenceInterval)
+    if (error) {
+      console.error("[v0] Error updating presence:", error)
+    } else {
+      console.log("[v0] Joined meeting, presence updated")
+    }
   }
 
   const handleLeaveMeeting = async () => {
-    if (!currentUser || !currentProject) return
-
-    // Update presence to show left meeting
-    await supabase
-      .from("user_presence")
-      .update({
-        current_view: null,
-        status: "online",
-        last_seen: new Date().toISOString(),
-      })
-      .eq("user_id", currentUser.id)
-      .eq("project_id", currentProject.id)
-
-    // Log activity
-    await supabase.from("activity_logs").insert({
-      project_id: currentProject.id,
-      user_id: currentUser.id,
-      user_name: currentUser.name || currentUser.email,
-      action: "left",
-      resource_type: "meeting",
-      resource_name: currentProject.name,
+    peerConnections.forEach((peerConn) => {
+      peerConn.connection.close()
     })
+    setPeerConnections(new Map())
 
-    // Stop all streams
     if (localStream) {
       localStream.getTracks().forEach((track) => track.stop())
       setLocalStream(null)
@@ -260,6 +224,18 @@ export function Meeting({ currentProjectId }: { currentProjectId: string | null 
     setIsMicOn(false)
     setIsVideoOn(false)
     setIsScreenSharing(false)
+
+    if (currentUser && currentProject) {
+      await supabase
+        .from("user_presence")
+        .update({
+          current_view: "chat",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("user_id", currentUser.id)
+
+      console.log("[v0] Left meeting, presence updated")
+    }
   }
 
   const initializeWebRTC = async (video: boolean, audio: boolean) => {
@@ -529,6 +505,162 @@ export function Meeting({ currentProjectId }: { currentProjectId: string | null 
     }
   }, [])
 
+  const createPeerConnection = async (userId: string): Promise<RTCPeerConnection> => {
+    const configuration: RTCConfiguration = {
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }],
+    }
+
+    const pc = new RTCPeerConnection(configuration)
+
+    // Add local stream tracks to peer connection
+    if (localStream) {
+      localStream.getTracks().forEach((track) => {
+        pc.addTrack(track, localStream)
+      })
+    }
+
+    // Handle incoming remote stream
+    pc.ontrack = (event) => {
+      console.log("[v0] Received remote stream from:", userId)
+      const remoteStream = event.streams[0]
+
+      setParticipants((prev) => prev.map((p) => (p.user_id === userId ? { ...p, stream: remoteStream } : p)))
+    }
+
+    // Handle ICE candidates
+    pc.onicecandidate = (event) => {
+      if (event.candidate && currentProject && currentUser) {
+        supabase.channel(`meeting:${currentProject.id}`).send({
+          type: "broadcast",
+          event: "ice-candidate",
+          payload: {
+            from: currentUser.id,
+            to: userId,
+            candidate: event.candidate,
+          },
+        })
+      }
+    }
+
+    setPeerConnections((prev) => {
+      const newMap = new Map(prev)
+      newMap.set(userId, { connection: pc })
+      return newMap
+    })
+
+    return pc
+  }
+
+  const handleOffer = async (fromUserId: string, offer: RTCSessionDescriptionInit) => {
+    console.log("[v0] Received offer from:", fromUserId)
+    const pc = await createPeerConnection(fromUserId)
+    await pc.setRemoteDescription(new RTCSessionDescription(offer))
+    const answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    if (currentProject && currentUser) {
+      supabase.channel(`meeting:${currentProject.id}`).send({
+        type: "broadcast",
+        event: "answer",
+        payload: {
+          from: currentUser.id,
+          to: fromUserId,
+          answer: answer,
+        },
+      })
+    }
+  }
+
+  const handleAnswer = async (fromUserId: string, answer: RTCSessionDescriptionInit) => {
+    console.log("[v0] Received answer from:", fromUserId)
+    const peerConn = peerConnections.get(fromUserId)
+    if (peerConn) {
+      await peerConn.connection.setRemoteDescription(new RTCSessionDescription(answer))
+    }
+  }
+
+  const handleIceCandidate = async (fromUserId: string, candidate: RTCIceCandidateInit) => {
+    const peerConn = peerConnections.get(fromUserId)
+    if (peerConn) {
+      await peerConn.connection.addIceCandidate(new RTCIceCandidate(candidate))
+    }
+  }
+
+  const initiateConnection = async (userId: string) => {
+    if (userId === currentUser?.id) return
+    if (peerConnections.has(userId)) return
+
+    console.log("[v0] Initiating connection with:", userId)
+    const pc = await createPeerConnection(userId)
+    const offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+
+    if (currentProject && currentUser) {
+      supabase.channel(`meeting:${currentProject.id}`).send({
+        type: "broadcast",
+        event: "offer",
+        payload: {
+          from: currentUser.id,
+          to: userId,
+          offer: offer,
+        },
+      })
+    }
+  }
+
+  useEffect(() => {
+    if (!currentProject || !hasJoined) return
+
+    const channel = supabase
+      .channel(`presence:${currentProject.id}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "user_presence" }, (payload) => {
+        console.log("[v0] Presence change detected:", payload)
+        loadParticipants()
+      })
+      .subscribe()
+
+    loadParticipants()
+
+    return () => {
+      channel.unsubscribe()
+    }
+  }, [currentProject, hasJoined])
+
+  const loadParticipants = async () => {
+    if (!currentProject) return
+
+    const { data, error } = await supabase
+      .from("user_presence")
+      .select("user_id, project_id, status, last_seen")
+      .eq("project_id", currentProject.id)
+      .eq("current_view", "meeting")
+
+    if (error) {
+      console.error("[v0] Error loading participants:", error)
+      return
+    }
+
+    const participantList: Participant[] =
+      data?.map((p: any) => ({
+        user_id: p.user_id,
+        user_name: p.user_id === currentUser?.id ? currentUser.name || "You" : "User",
+        status: p.status,
+        last_seen: p.last_seen,
+      })) || []
+
+    setParticipants(participantList)
+
+    if (hasJoined && currentUser) {
+      participantList.forEach((participant) => {
+        if (participant.user_id !== currentUser.id && !peerConnections.has(participant.user_id)) {
+          initiateConnection(participant.user_id)
+        }
+      })
+    }
+
+    console.log("[v0] Meeting participants loaded:", participantList.length)
+  }
+
   if (!currentProject) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -643,18 +775,46 @@ export function Meeting({ currentProjectId }: { currentProjectId: string | null 
                       key={participant.user_id}
                       className="relative flex items-center justify-center rounded-lg bg-muted/50 overflow-hidden aspect-video"
                     >
-                      {participant.user_id === currentUser?.id && isVideoOn && localStream ? (
-                        <video ref={localVideoRef} autoPlay playsInline muted className="h-full w-full object-cover" />
+                      {participant.user_id === currentUser?.id ? (
+                        isVideoOn && localStream ? (
+                          <video
+                            ref={localVideoRef}
+                            autoPlay
+                            playsInline
+                            muted
+                            className="h-full w-full object-cover"
+                          />
+                        ) : (
+                          <Avatar className="h-24 w-24">
+                            <AvatarFallback>{currentUser?.name?.[0] || "U"}</AvatarFallback>
+                          </Avatar>
+                        )
+                      ) : participant.stream ? (
+                        <video
+                          ref={(el) => {
+                            if (el) {
+                              remoteVideoRefs.current.set(participant.user_id, el)
+                              el.srcObject = participant.stream
+                              el.play().catch((e) => console.log("[v0] Remote video play error:", e))
+                            }
+                          }}
+                          autoPlay
+                          playsInline
+                          className="h-full w-full object-cover"
+                        />
                       ) : (
                         <Avatar className="h-24 w-24">
-                          <AvatarFallback>
-                            {participant.user_id === currentUser?.id ? currentUser?.name?.[0] || "U" : "U"}
-                          </AvatarFallback>
+                          <AvatarFallback>U</AvatarFallback>
                         </Avatar>
                       )}
                       <div className="absolute bottom-2 left-2 rounded bg-black/70 px-2 py-1 text-xs text-white">
-                        {participant.user_id === currentUser?.id ? "You" : "User"}
+                        {participant.user_id === currentUser?.id ? "You" : participant.user_name}
                       </div>
+                      {participant.user_id === currentUser?.id && !isMicOn && (
+                        <div className="absolute top-2 right-2 rounded-full bg-red-500/90 p-1.5">
+                          <MicOff className="h-3 w-3 text-white" />
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>

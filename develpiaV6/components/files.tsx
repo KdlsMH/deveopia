@@ -114,14 +114,19 @@ export function Files({ currentProject, currentUser }: FilesProps) {
 
     Array.from(uploadedFiles).forEach(async (file) => {
       try {
-        // Upload to Supabase Storage
         const filePath = `${currentProject.id}/${Date.now()}-${file.name}`
+        console.log("[v0] Uploading file to storage:", filePath)
+
         const { data: uploadData, error: uploadError } = await supabase.storage
           .from("project-files")
-          .upload(filePath, file)
+          .upload(filePath, file, {
+            cacheControl: "3600",
+            upsert: false,
+          })
 
         if (uploadError) {
           console.error("[v0] Error uploading to storage:", uploadError)
+          alert(`Failed to upload ${file.name}: ${uploadError.message}`)
           return
         }
 
@@ -129,6 +134,8 @@ export function Files({ currentProject, currentUser }: FilesProps) {
         const {
           data: { publicUrl },
         } = supabase.storage.from("project-files").getPublicUrl(filePath)
+
+        console.log("[v0] File uploaded, saving metadata:", publicUrl)
 
         // Save metadata to database
         const { error } = await supabase.from("files").insert({
@@ -159,6 +166,7 @@ export function Files({ currentProject, currentUser }: FilesProps) {
         console.log("[v0] File uploaded successfully:", file.name)
       } catch (error) {
         console.error("[v0] Upload error:", error)
+        alert(`Failed to upload ${file.name}`)
       }
     })
 

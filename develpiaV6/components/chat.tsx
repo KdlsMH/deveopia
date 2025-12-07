@@ -112,6 +112,7 @@ export function Chat({ currentProject, currentUser }: ChatProps) {
         return
       }
 
+      console.log("[v0] Fetched messages for channel:", currentChannel.name, data?.length)
       setMessages(data || [])
     }
 
@@ -128,10 +129,13 @@ export function Chat({ currentProject, currentUser }: ChatProps) {
           filter: `channel_id=eq.${currentChannel.id}`,
         },
         (payload) => {
+          console.log("[v0] New message received:", payload.new)
           setMessages((prev) => [...prev, payload.new as Message])
         },
       )
-      .subscribe()
+      .subscribe((status) => {
+        console.log("[v0] Message subscription status:", status)
+      })
 
     return () => {
       messageSubscription.unsubscribe()

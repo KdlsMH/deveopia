@@ -20,6 +20,14 @@ interface Path {
   width: number
 }
 
+interface RemoteCursor {
+  userId: string
+  userName: string
+  x: number
+  y: number
+  color: string
+}
+
 const colors = [
   { name: "Black", value: "#000000" },
   { name: "Red", value: "#ef4444" },
@@ -55,6 +63,8 @@ export function Whiteboard({ currentProject, currentUser }: WhiteboardProps) {
     visible: false,
   })
   const [isConnected, setIsConnected] = useState(false)
+  const [remoteCursors, setRemoteCursors] = useState<Map<string, RemoteCursor>>(new Map())
+  const channelRef = useRef<any>(null)
 
   useEffect(() => {
     if (!currentProject) return
@@ -68,8 +78,21 @@ export function Whiteboard({ currentProject, currentUser }: WhiteboardProps) {
         .limit(1)
         .single()
 
-      if (error && error.code !== "PGRST116") {
-        console.error("[v0] Error loading whiteboard:", error)
+      if (error) {
+        if (error.code === "PGRST116") {
+          console.log("[v0] No whiteboard data found, creating new one")
+          const { error: insertError } = await supabase.from("whiteboard_data").insert({
+            project_id: currentProject.id,
+            user_id: currentUser?.id,
+            paths: [],
+          })
+
+          if (insertError) {
+            console.error("[v0] Error creating whiteboard:", insertError)
+          }
+        } else {
+          console.error("[v0] Error loading whiteboard:", error)
+        }
         return
       }
 
@@ -81,7 +104,7 @@ export function Whiteboard({ currentProject, currentUser }: WhiteboardProps) {
     }
 
     loadWhiteboard()
-  }, [currentProject])
+  }, [currentProject, currentUser])
 
   useEffect(() => {
     if (!currentProject || !currentUser || paths.length === 0) return
@@ -108,10 +131,10 @@ export function Whiteboard({ currentProject, currentUser }: WhiteboardProps) {
           paths: paths,
         })
       }
-    }, 1000)
+    }, 2000)
 
     return () => clearTimeout(timer)
-  }, [paths, currentProject, currentUser])
+  }, [paths, currentProject, currentUser, supabase])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -153,37 +176,67 @@ export function Whiteboard({ currentProject, currentUser }: WhiteboardProps) {
   }, [paths, zoom, panX, panY])
 
   useEffect(() => {
-    if (!currentProject) return
+    if (!currentProject || !currentUser) return
 
-    const channel = supabase
-      .channel(`whiteboard:${currentProject.id}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "whiteboard_data",
-          filter: `project_id=eq.${currentProject.id}`,
-        },
-        (payload) => {
-          console.log("[v0] Whiteboard updated remotely")
-          if (payload.new.paths) {
-            setPaths(payload.new.paths as Path[])
-          }
-        },
-      )
+    const channel = supabase.channel(`whiteboard:${currentProject.id}`, {
+      config: {
+        broadcast: { self: false },
+      },
+    })
+
+    channel
+      .on("broadcast", { event: "draw" }, (payload) => {
+        console.log("[v0] Received remote draw event")
+        const { path, userId } = payload.payload
+        if (userId !== currentUser.id) {
+          setPaths((prev) => [...prev, path as Path])
+        }
+      })
+      .on("broadcast", { event: "clear" }, (payload) => {
+        console.log("[v0] Received remote clear event")
+        const { userId } = payload.payload
+        if (userId !== currentUser.id) {
+          setPaths([])
+        }
+      })
+      .on("broadcast", { event: "undo" }, (payload) => {
+        const { paths: newPaths, userId } = payload.payload
+        if (userId !== currentUser.id) {
+          setPaths(newPaths as Path[])
+        }
+      })
+      .on("broadcast", { event: "cursor" }, (payload) => {
+        const { userId, userName, x, y, color: cursorColor } = payload.payload
+        if (userId !== currentUser.id) {
+          setRemoteCursors((prev) => {
+            const updated = new Map(prev)
+            updated.set(userId, { userId, userName, x, y, color: cursorColor })
+            return updated
+          })
+        }
+      })
+      .on("broadcast", { event: "cursor_leave" }, (payload) => {
+        const { userId } = payload.payload
+        setRemoteCursors((prev) => {
+          const updated = new Map(prev)
+          updated.delete(userId)
+          return updated
+        })
+      })
       .subscribe((status) => {
         if (status === "SUBSCRIBED") {
           setIsConnected(true)
-          console.log("[v0] Whiteboard real-time connected")
+          console.log("[v0] Whiteboard real-time broadcast connected")
         }
       })
+
+    channelRef.current = channel
 
     return () => {
       channel.unsubscribe()
       setIsConnected(false)
     }
-  }, [currentProject, supabase])
+  }, [currentProject, currentUser, supabase])
 
   const getCoordinates = (e: React.MouseEvent<HTMLCanvasElement>): Point => {
     const canvas = canvasRef.current
@@ -251,6 +304,17 @@ export function Whiteboard({ currentProject, currentUser }: WhiteboardProps) {
       newHistory.push(newPaths)
       setHistory(newHistory)
       setHistoryStep(newHistory.length - 1)
+
+      if (channelRef.current && currentUser) {
+        channelRef.current.send({
+          type: "broadcast",
+          event: "draw",
+          payload: {
+            path: newPath,
+            userId: currentUser.id,
+          },
+        })
+      }
     }
 
     setIsDrawing(false)
@@ -282,19 +346,55 @@ export function Whiteboard({ currentProject, currentUser }: WhiteboardProps) {
     const newHistory = [...history, []]
     setHistory(newHistory)
     setHistoryStep(newHistory.length - 1)
+
+    if (channelRef.current && currentUser) {
+      channelRef.current.send({
+        type: "broadcast",
+        event: "clear",
+        payload: {
+          userId: currentUser.id,
+        },
+      })
+    }
   }
 
   const undo = () => {
     if (historyStep > 0) {
-      setHistoryStep(historyStep - 1)
-      setPaths(history[historyStep - 1])
+      const newStep = historyStep - 1
+      setHistoryStep(newStep)
+      const newPaths = history[newStep]
+      setPaths(newPaths)
+
+      if (channelRef.current && currentUser) {
+        channelRef.current.send({
+          type: "broadcast",
+          event: "undo",
+          payload: {
+            paths: newPaths,
+            userId: currentUser.id,
+          },
+        })
+      }
     }
   }
 
   const redo = () => {
     if (historyStep < history.length - 1) {
-      setHistoryStep(historyStep + 1)
-      setPaths(history[historyStep + 1])
+      const newStep = historyStep + 1
+      setHistoryStep(newStep)
+      const newPaths = history[newStep]
+      setPaths(newPaths)
+
+      if (channelRef.current && currentUser) {
+        channelRef.current.send({
+          type: "broadcast",
+          event: "undo",
+          payload: {
+            paths: newPaths,
+            userId: currentUser.id,
+          },
+        })
+      }
     }
   }
 
@@ -313,11 +413,28 @@ export function Whiteboard({ currentProject, currentUser }: WhiteboardProps) {
     if (!canvas) return
 
     const rect = canvas.getBoundingClientRect()
+    const localX = e.clientX - rect.left
+    const localY = e.clientY - rect.top
+
     setCursorPreview({
-      x: e.clientX - rect.left,
-      y: e.clientY - rect.top,
+      x: localX,
+      y: localY,
       visible: true,
     })
+
+    if (channelRef.current && currentUser) {
+      channelRef.current.send({
+        type: "broadcast",
+        event: "cursor",
+        payload: {
+          userId: currentUser.id,
+          userName: currentUser.name || currentUser.email,
+          x: localX,
+          y: localY,
+          color: color,
+        },
+      })
+    }
 
     if (isDrawing) {
       draw(e)
@@ -327,6 +444,16 @@ export function Whiteboard({ currentProject, currentUser }: WhiteboardProps) {
   const handleMouseLeave = () => {
     setCursorPreview({ ...cursorPreview, visible: false })
     stopDrawing()
+
+    if (channelRef.current && currentUser) {
+      channelRef.current.send({
+        type: "broadcast",
+        event: "cursor_leave",
+        payload: {
+          userId: currentUser.id,
+        },
+      })
+    }
   }
 
   if (!currentProject) {
@@ -462,6 +589,26 @@ export function Whiteboard({ currentProject, currentUser }: WhiteboardProps) {
               }}
             />
           )}
+
+          {Array.from(remoteCursors.values()).map((cursor) => (
+            <div
+              key={cursor.userId}
+              className="pointer-events-none absolute"
+              style={{
+                left: cursor.x,
+                top: cursor.y,
+                transform: "translate(-50%, -50%)",
+              }}
+            >
+              <div
+                className="h-4 w-4 rounded-full border-2 border-white shadow-lg"
+                style={{ backgroundColor: cursor.color }}
+              />
+              <div className="mt-1 whitespace-nowrap rounded bg-black/75 px-2 py-1 text-xs text-white">
+                {cursor.userName}
+              </div>
+            </div>
+          ))}
         </Card>
       </div>
     </div>

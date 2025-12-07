@@ -70,8 +70,22 @@ export function Dashboard({ setCurrentView }: DashboardProps) {
       if (projectsError) {
         console.error("[v0] Error fetching projects:", projectsError)
       } else {
-        console.log("[v0] Fetched projects:", projectsData)
-        setProjects(projectsData || [])
+        const projectsWithMemberCount = await Promise.all(
+          (projectsData || []).map(async (project) => {
+            const { count } = await supabase
+              .from("project_members")
+              .select("*", { count: "exact", head: true })
+              .eq("project_id", project.id)
+
+            return {
+              ...project,
+              member_count: count || 0,
+            }
+          }),
+        )
+
+        console.log("[v0] Fetched projects with member counts:", projectsWithMemberCount)
+        setProjects(projectsWithMemberCount)
       }
 
       const { data: meetingsData, error: meetingsError } = await supabase
@@ -224,6 +238,10 @@ export function Dashboard({ setCurrentView }: DashboardProps) {
                           <div className="flex items-center gap-1">
                             <Calendar className="h-3 w-3" />
                             {format(new Date(project.updated_at), "MMM d")}
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <Users className="h-3 w-3" />
+                            {project.member_count || 0} members
                           </div>
                         </div>
                       </CardContent>
